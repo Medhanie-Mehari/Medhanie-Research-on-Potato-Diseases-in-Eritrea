@@ -1,6 +1,6 @@
 # ==============================================================================
-# Objective 1 — Prevalence, spatial distribution and environmental correlates
-#               of potato microbial diseases (field survey, June–August 2023)
+# Disease prevalence, spatial distribution and environmental correlates
+# — analysis of plant-level field survey data
 # ==============================================================================
 # Script  : 01_prevalence_analysis.R
 # Authors : <AUTHOR NAMES>
@@ -8,24 +8,20 @@
 # Licence : <LICENCE, e.g. MIT>
 # Tested  : R 4.4.1 (see SessionInfo.txt written at the end of the run)
 #
-# Output  : 8 PNG figures (400 dpi), 15 CSV tables, 1 Excel workbook
+# Output  : up to 8 PNG figures (400 dpi), 15 CSV tables, 1 Excel workbook
 #
-# Input data are NOT distributed with this script. See README for the
-# expected column structure and the data availability statement.
+# All results, tables and figures are computed from the input data supplied
+# in Section 0. No data are distributed with this script.
 #
-# ------------------------------------------------------------------------------
-# TRANSPARENCY NOTE — values transcribed from the manuscript
-# ------------------------------------------------------------------------------
-# The following objects contain values typed in from the published manuscript;
-# they are NOT computed by this script:
-#   * nonpar_tab$MS_reported         (Section 3)
-#   * pom_fit_ms                      (Section 4; incl. Brant omnibus p-values)
-#   * log_fit_ms                      (Section 5)
-#   * POM_MS, LOG_MS  -> Figure 5     (Section 7)
-#   * hist_v, pvx_d, cum -> Figure 6  (Section 7; compiled from literature:
-#                                      <REFERENCES FOR HISTORICAL DATA>)
-# The model estimates computed from the data are written to T07 and T09.
-# <EXPLAIN HERE WHY FIGURE 5 USES MANUSCRIPT VALUES RATHER THAN T07/T09>
+# Required input columns (one row per plant-level observation):
+#   Disease_Name, Disease_Type (Fungal/Viral/Bacterial/Other/Unidentified),
+#   Severity (ordinal score), Is_Named, Is_Specific_Named, Is_Other (TRUE/FALSE),
+#   Region, Subzone, Subzone_Display, Name (farm identifier), Farm_ID,
+#   Longitude, Latitude, Temperature_C, RH_pct, Soil_pH, Altitude, PlantAge,
+#   Density_Category (Low/Medium/High), Density_Numeric, Plants_Assessed,
+#   Area_Ha_farm, Farm_Incidence_pct, Subzone_N_Total, Subzone_Incidence_pct,
+#   Subzone_Mean_DSI, Subzone_Disease_Richness,
+#   Inc_<Disease> (farm-level 0/1 incidence, one column per disease)
 #
 # Implementation notes:
 #   1. MASS is loaded before dplyr so that dplyr::select() is not masked.
@@ -33,7 +29,7 @@
 #   3. All dplyr verbs are namespaced (dplyr::) throughout.
 #   4. Label offsets for Figure 3 are pre-computed (dsi_offset) outside aes().
 #   5. Moran's I uses Longitude/Latitude vectors directly.
-#   6. POMs are fitted for any disease with n >= 30 observations.
+#   6. POMs are fitted for every disease with n >= MIN_N_POM observations.
 # ==============================================================================
 
 
@@ -41,6 +37,26 @@
 
 DATA_FILE <- "<PATH_TO_INPUT_DATA>/<INPUT_DATA_FILE>.csv"
 OUT_DIR   <- "<PATH_TO_OUTPUT_FOLDER>"
+
+# Environmental predictors used in both regression models
+PREDICTORS <- c("Temperature_C", "RH_pct", "Soil_pH", "Altitude", "PlantAge", "Density_Numeric")
+
+# Minimum number of observations for a disease to be modelled by the POM
+MIN_N_POM <- 30
+
+# Number of most frequent diseases shown in the frequency figures
+N_TOP <- 10
+
+# Optional: a disease tested for occurring at lower altitude than all others
+# (Section 3, Figure 7). Leave the placeholder to skip these tests.
+FOCAL_DISEASE     <- "<FOCAL_DISEASE_NAME>"
+FOCAL_ALTERNATIVE <- "less"   # "less", "greater" or "two.sided"
+
+# Optional: historical data for Figure 6. Leave the placeholders to skip.
+#   Incidence file columns : Year, Group, Incidence_pct
+#   Taxa file columns      : Year, Disease_Type, Cumulative_n
+HIST_INCIDENCE_FILE <- "<PATH_TO_HISTORICAL_INCIDENCE_FILE>.csv"
+HIST_TAXA_FILE      <- "<PATH_TO_CUMULATIVE_TAXA_FILE>.csv"
 
 if (!file.exists(DATA_FILE))
   stop("Input data not found. Set DATA_FILE in Section 0 to your data file.")
@@ -53,9 +69,8 @@ dir.create(TAB_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # ── 0. PACKAGES ──────────────────────────────────────────────────────────────
 
-need <- c("MASS", "car", "pscl", "DescTools", "brant", "spdep",
-          "dplyr", "tidyr", "ggplot2", "patchwork", "scales",
-          "RColorBrewer", "openxlsx", "dunn.test")
+need <- c("MASS", "DescTools", "brant", "spdep", "dplyr", "tidyr",
+          "ggplot2", "patchwork", "scales", "openxlsx", "dunn.test")
 for (p in need)
   if (!requireNamespace(p, quietly = TRUE))
     install.packages(p, repos = "https://cloud.r-project.org")
@@ -68,17 +83,14 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(patchwork)
   library(scales)
-  library(car)
-  library(pscl)
   library(DescTools)
   library(brant)
   library(spdep)
   library(dunn.test)
   library(openxlsx)
-  library(RColorBrewer)
 })
 
-cat("=== Objective 1 analysis started:", format(Sys.time()), "===\n")
+cat("=== Analysis started:", format(Sys.time()), "===\n")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -94,15 +106,26 @@ save_tab <- function(d, name) {
   cat("  Table:", name, "\n")
 }
 
+fmt_p <- function(p) ifelse(p < 0.001, "p<0.001", sprintf("p=%.3f", p))
+stars <- function(p) ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "")))
+
+# Readable labels for predictors in Figure 5 (unlisted predictors keep their name)
+PRED_LABELS <- c(Temperature_C   = "Temperature (per 1°C)",
+                 RH_pct          = "Relative Humidity (per 1%)",
+                 Soil_pH         = "Soil pH (per unit)",
+                 Altitude        = "Altitude (per 1 m)",
+                 PlantAge        = "Plant Age (per day)",
+                 Density_Numeric = "Plant Density (per unit)")
+lab_pred <- function(x) ifelse(x %in% names(PRED_LABELS), PRED_LABELS[x], x)
+
 
 # ── Colour palettes ──────────────────────────────────────────────────────────
 
 CF <- "#2D8653"; CV <- "#B5342A"; CB <- "#2166AC"
 CA <- "#E07B39"; CG <- "#7B4F9E"
+PAL <- c(CB, CF, CA, CG, CV, "#4D4D4D", "#1B9E77", "#E7298A", "#A6761D", "#66A61E")
 
 DCOL <- c(Fungal = CF, Viral = CV, Bacterial = CB)
-RCOL <- c("Maekel (Central)" = CB, "Debub (Southern)" = CF,
-          Anseba = CA, "Gash Barka" = CG)
 
 
 # ── Publication theme ────────────────────────────────────────────────────────
@@ -135,6 +158,15 @@ raw <- read.csv(DATA_FILE, stringsAsFactors = FALSE,
                 na.strings = c("NA", "", "N/A"))
 cat(sprintf("  Loaded: %d rows x %d columns\n", nrow(raw), ncol(raw)))
 
+required <- c("Disease_Name", "Disease_Type", "Severity", "Is_Named", "Is_Specific_Named",
+              "Is_Other", "Region", "Subzone", "Subzone_Display", "Name", "Farm_ID",
+              "Longitude", "Latitude", PREDICTORS, "Density_Category", "Plants_Assessed",
+              "Area_Ha_farm", "Farm_Incidence_pct", "Subzone_N_Total",
+              "Subzone_Incidence_pct", "Subzone_Mean_DSI", "Subzone_Disease_Richness")
+missing_cols <- setdiff(required, names(raw))
+if (length(missing_cols) > 0)
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+
 # Boolean columns exported as "True"/"False" text are read as character
 bool_cols <- c("Is_Named", "Is_Specific_Named", "Is_Other",
                "Is_Unidentified", "Is_Symptomatic", "For_Incidence_Calc")
@@ -165,11 +197,11 @@ raw <- dplyr::mutate(raw,
 
 # Sub-datasets
 df     <- raw
-named  <- dplyr::filter(raw, Is_Named)           # 703 named records
-df_vis <- dplyr::filter(raw, Is_Specific_Named)  # 631, excl. VMI & AMV
-symp   <- dplyr::filter(raw, !Is_Other)          # 721, excl. "Other"
+named  <- dplyr::filter(raw, Is_Named)           # records with a named disease
+df_vis <- dplyr::filter(raw, Is_Specific_Named)  # records with a specific disease name
+symp   <- dplyr::filter(raw, !Is_Other)          # excluding "Other"
 
-# Farm-level dataset (79 rows; one per farm)
+# Farm-level dataset (one row per farm)
 df_farm <- raw %>%
   dplyr::group_by(Name, Subzone, Region) %>%
   dplyr::summarise(
@@ -189,10 +221,17 @@ df_farm <- raw %>%
     dplyr::across(dplyr::starts_with("Inc_"), dplyr::first),
     .groups = "drop"
   )
-stopifnot(nrow(df_farm) == 79)
 
-cat(sprintf("  df=%d | named=%d | df_vis=%d | df_farm=%d\n",
-            nrow(df), nrow(named), nrow(df_vis), nrow(df_farm)))
+# Study-level counts used as denominators
+N_NAMED  <- nrow(named)
+N_FARMS  <- nrow(df_farm)
+N_PLANTS <- raw %>%
+  dplyr::distinct(Subzone, Subzone_N_Total) %>%
+  dplyr::pull(Subzone_N_Total) %>%
+  sum(na.rm = TRUE)
+
+cat(sprintf("  df=%d | named=%d | df_vis=%d | df_farm=%d | plants assessed=%d\n",
+            nrow(df), N_NAMED, nrow(df_vis), N_FARMS, N_PLANTS))
 
 
 # ==============================================================================
@@ -200,18 +239,17 @@ cat(sprintf("  df=%d | named=%d | df_vis=%d | df_farm=%d\n",
 # ==============================================================================
 cat("\n=== SECTION 2: Descriptive statistics ===\n")
 
-# 703 = named disease records; 4648 = total plants assessed
 dis_freq <- named %>%
   dplyr::count(Disease_Name, Disease_Type) %>%
-  dplyr::mutate(Pct_of_703  = round(n / 703 * 100, 1),
-                Pct_of_4648 = round(n / 4648 * 100, 2)) %>%
+  dplyr::mutate(Pct_of_named  = round(n / N_NAMED * 100, 1),
+                Pct_of_plants = round(n / N_PLANTS * 100, 2)) %>%
   dplyr::arrange(dplyr::desc(n))
 
 type_totals <- named %>%
   dplyr::group_by(Disease_Type) %>%
-  dplyr::summarise(N_diseases = dplyr::n_distinct(Disease_Name),
-                   N_records  = dplyr::n(),
-                   Pct_of_703 = round(dplyr::n() / 703 * 100, 1),
+  dplyr::summarise(N_diseases   = dplyr::n_distinct(Disease_Name),
+                   N_records    = dplyr::n(),
+                   Pct_of_named = round(dplyr::n() / N_NAMED * 100, 1),
                    .groups = "drop")
 cat("  Type totals:\n"); print(as.data.frame(type_totals))
 
@@ -229,7 +267,7 @@ sub_summary <- raw %>%
   dplyr::summarise(
     Farms            = dplyr::n_distinct(Name),
     Plants_Assessed  = dplyr::first(Subzone_N_Total),
-    Pct_of_4648      = round(dplyr::first(Subzone_N_Total) / 4648 * 100, 1),
+    Pct_of_plants    = round(dplyr::first(Subzone_N_Total) / N_PLANTS * 100, 1),
     W_Inc_pct        = dplyr::first(Subzone_Incidence_pct),
     Mean_DSI_0to5    = dplyr::first(Subzone_Mean_DSI),
     Disease_Richness = dplyr::first(Subzone_Disease_Richness),
@@ -250,7 +288,7 @@ env_summary <- df_farm %>%
 save_tab(dis_freq,    "T01_Disease_Frequency.csv")
 save_tab(type_totals, "T02_Disease_Type_Totals.csv")
 save_tab(dsi_disease, "T03_DSI_per_Disease.csv")
-save_tab(sub_summary, "T04_Subregion_Summary_Table3.csv")
+save_tab(sub_summary, "T04_Subregion_Summary.csv")
 save_tab(env_summary, "T05_Environmental_Summary.csv")
 
 
@@ -259,53 +297,63 @@ save_tab(env_summary, "T05_Environmental_Summary.csv")
 # ==============================================================================
 cat("\n=== SECTION 3: Non-parametric tests ===\n")
 
+np_rows <- list()
+add_np <- function(test, stat, p)
+  np_rows[[length(np_rows) + 1]] <<- data.frame(Test = test, Statistic = stat,
+                                                p_num = p, stringsAsFactors = FALSE)
+
 kw_sev <- kruskal.test(Severity ~ Disease_Type, data = named)
 cat(sprintf("  KW Severity x Type: H=%.3f, p=%.4g\n",
             kw_sev$statistic, kw_sev$p.value))
 suppressMessages(dunn.test::dunn.test(named$Severity, named$Disease_Type,
                                       method = "bonferroni", kw = FALSE, list = FALSE))
+add_np("KW Severity x Type", round(kw_sev$statistic, 3), kw_sev$p.value)
 
 kw_alt <- kruskal.test(Altitude ~ Disease_Type, data = named)
 cat(sprintf("  KW Altitude x Type: H=%.3f, p=%.4f\n",
             kw_alt$statistic, kw_alt$p.value))
+add_np("KW Altitude x Type", round(kw_alt$statistic, 3), kw_alt$p.value)
 
-vw_alt  <- named$Altitude[named$Disease_Name == "Verticillium Wilt"]
-oth_alt <- named$Altitude[named$Disease_Name != "Verticillium Wilt"]
-mw_vw   <- wilcox.test(vw_alt, oth_alt, alternative = "less", exact = FALSE)
-cat(sprintf("  MW Verticillium < others: U=%.0f, p=%.4g\n",
-            mw_vw$statistic, mw_vw$p.value))
-cat(sprintf("  VW mean alt=%.1f m | Others mean alt=%.1f m\n",
-            mean(vw_alt, na.rm = TRUE), mean(oth_alt, na.rm = TRUE)))
+has_focal <- FOCAL_DISEASE %in% named$Disease_Name
+if (has_focal) {
+  foc_alt <- named$Altitude[named$Disease_Name == FOCAL_DISEASE]
+  oth_alt <- named$Altitude[named$Disease_Name != FOCAL_DISEASE]
+  mw_foc  <- wilcox.test(foc_alt, oth_alt, alternative = FOCAL_ALTERNATIVE, exact = FALSE)
+  cat(sprintf("  MW %s vs others (%s): U=%.0f, p=%.4g\n",
+              FOCAL_DISEASE, FOCAL_ALTERNATIVE, mw_foc$statistic, mw_foc$p.value))
+  cat(sprintf("  %s mean alt=%.1f m | Others mean alt=%.1f m\n", FOCAL_DISEASE,
+              mean(foc_alt, na.rm = TRUE), mean(oth_alt, na.rm = TRUE)))
+  add_np(sprintf("MW %s altitude vs others (%s)", FOCAL_DISEASE, FOCAL_ALTERNATIVE),
+         round(mw_foc$statistic, 0), mw_foc$p.value)
 
-sp_sub <- named %>%
-  dplyr::filter(Disease_Name == "Verticillium Wilt") %>%
-  dplyr::group_by(Subzone) %>%
-  dplyr::summarise(N_VW     = dplyr::n(),
-                   Mean_Alt = mean(Altitude, na.rm = TRUE), .groups = "drop")
-sp_vw <- cor.test(sp_sub$Mean_Alt, sp_sub$N_VW, method = "spearman", exact = FALSE)
-cat(sprintf("  Spearman rho=%.3f, p=%.4f, n=%d sub-regions\n",
-            sp_vw$estimate, sp_vw$p.value, nrow(sp_sub)))
+  sp_sub <- named %>%
+    dplyr::filter(Disease_Name == FOCAL_DISEASE) %>%
+    dplyr::group_by(Subzone) %>%
+    dplyr::summarise(N_foc    = dplyr::n(),
+                     Mean_Alt = mean(Altitude, na.rm = TRUE), .groups = "drop")
+  if (nrow(sp_sub) >= 3) {
+    sp_foc <- cor.test(sp_sub$Mean_Alt, sp_sub$N_foc, method = "spearman", exact = FALSE)
+    cat(sprintf("  Spearman rho=%.3f, p=%.4f, n=%d sub-regions\n",
+                sp_foc$estimate, sp_foc$p.value, nrow(sp_sub)))
+    add_np(sprintf("Spearman rho (altitude vs %s frequency)", FOCAL_DISEASE),
+           round(sp_foc$estimate, 3), sp_foc$p.value)
+  }
+} else {
+  cat("  Focal-disease tests skipped (FOCAL_DISEASE not set or not found)\n")
+}
 
 sub_corr <- raw %>%
   dplyr::group_by(Subzone) %>%
   dplyr::summarise(W_Inc = dplyr::first(Subzone_Incidence_pct),
                    DSI   = dplyr::first(Subzone_Mean_DSI), .groups = "drop")
 cor_id <- cor.test(sub_corr$W_Inc, sub_corr$DSI, method = "pearson")
-cat(sprintf("  Pearson r=%.3f, p=%.4f (n=14)\n", cor_id$estimate, cor_id$p.value))
+cat(sprintf("  Pearson r=%.3f, p=%.4f (n=%d)\n", cor_id$estimate, cor_id$p.value, nrow(sub_corr)))
+add_np("Pearson r (weighted incidence vs DSI)", round(cor_id$estimate, 3), cor_id$p.value)
 
-nonpar_tab <- data.frame(
-  Test = c("KW Severity x Type", "KW Altitude x Type",
-           "MW Verticillium alt < others",
-           "Spearman rho (altitude vs VW freq)",
-           "Pearson r (weighted incidence vs DSI)"),
-  Statistic = c(round(kw_sev$statistic, 3), round(kw_alt$statistic, 3),
-                round(mw_vw$statistic, 0), round(sp_vw$estimate, 3),
-                round(cor_id$estimate, 3)),
-  p_value = formatC(c(kw_sev$p.value, kw_alt$p.value, mw_vw$p.value,
-                      sp_vw$p.value, cor_id$p.value), digits = 4, format = "g"),
-  MS_reported = c("H=149.21", "H=10.619", "U=11270", "rho=-0.769", "r=-0.005"),  # from manuscript
-  Sig = c("Yes", "Yes", "Yes", "Yes", "No"),
-  stringsAsFactors = FALSE)
+nonpar_tab <- do.call(rbind, np_rows)
+nonpar_tab$p_value <- formatC(nonpar_tab$p_num, digits = 4, format = "g")
+nonpar_tab$Sig     <- ifelse(nonpar_tab$p_num < 0.05, "Yes", "No")
+nonpar_tab$p_num   <- NULL
 save_tab(nonpar_tab, "T06_NonParametric_Tests.csv")
 
 
@@ -314,17 +362,17 @@ save_tab(nonpar_tab, "T06_NonParametric_Tests.csv")
 # ==============================================================================
 cat("\n=== SECTION 4: POM ===\n")
 
+pom_formula <- as.formula(paste("Sev_f ~", paste(PREDICTORS, collapse = " + ")))
+
 run_pom <- function(disease_name) {
   sub <- dplyr::filter(named, Disease_Name == disease_name) %>%
     dplyr::mutate(Sev_f = factor(Severity, ordered = TRUE))
   n <- nrow(sub)
   cat(sprintf("\n  POM: %s (n=%d)\n", disease_name, n))
-  if (n < 30) { cat("  SKIP: n < 30\n"); return(NULL) }
+  if (n < MIN_N_POM) { cat(sprintf("  SKIP: n < %d\n", MIN_N_POM)); return(NULL) }
 
   mod <- tryCatch(
-    MASS::polr(Sev_f ~ Temperature_C + RH_pct + Soil_pH +
-                 Altitude + PlantAge + Density_Numeric,
-               data = sub, Hess = TRUE, method = "logistic"),
+    MASS::polr(pom_formula, data = sub, Hess = TRUE, method = "logistic"),
     error = function(e) { cat("  ERROR:", e$message, "\n"); NULL })
   if (is.null(mod)) return(NULL)
 
@@ -335,69 +383,68 @@ run_pom <- function(disease_name) {
                    error = function(e) exp(cbind(beta - 1.96 * se, beta + 1.96 * se)))
   OR   <- exp(beta)
   idx  <- !grepl("\\|", rownames(ctab))
+  # confint() returns predictor rows only; match CI rows to predictors by name
+  ci   <- ci[rownames(ctab)[idx], , drop = FALSE]
 
   null_ll <- as.numeric(logLik(MASS::polr(Sev_f ~ 1, data = sub, Hess = TRUE)))
   full_ll <- as.numeric(logLik(mod))
   mcfR2   <- round(1 - full_ll / null_ll, 3)
   cat(sprintf("  AIC=%.2f | McFadden R2=%.3f\n", AIC(mod), mcfR2))
 
-  tryCatch({ br <- brant::brant(mod)
-             cat("  Brant test:\n"); print(br) }, error = function(e) NULL)
+  cat("  Brant test:\n")
+  brant_p <- tryCatch({
+    br <- brant::brant(mod)
+    round(as.numeric(br["Omnibus", "probability"]), 3)
+  }, error = function(e) NA_real_)
 
-  list(model = mod,
+  list(model   = mod,
+       disease = disease_name,
        results = data.frame(
          Disease     = disease_name, n = n,
          Predictor   = rownames(ctab)[idx],
          OR          = round(OR[idx], 3),
-         CI_L        = round(ci[idx, 1], 3),
-         CI_H        = round(ci[idx, 2], 3),
+         CI_L        = round(ci[, 1], 3),
+         CI_H        = round(ci[, 2], 3),
          p_value     = round(pv[idx], 4),
          Sig         = ifelse(pv[idx] < 0.05, "Yes", "No"),
          AIC         = round(AIC(mod), 2),
          McFadden_R2 = mcfR2,
          stringsAsFactors = FALSE),
-       aic = round(AIC(mod), 2), mcfR2 = mcfR2)
+       fit = data.frame(Disease = disease_name, n = n,
+                        AIC = round(AIC(mod), 2), McFadden_R2 = mcfR2,
+                        Brant_p_omnibus = brant_p, stringsAsFactors = FALSE))
 }
 
-pom_pvy  <- run_pom("PVY")
-pom_eb   <- run_pom("Early Blight")
-pom_vw   <- run_pom("Verticillium Wilt")
-pom_plrv <- run_pom("PLRV")
+# Fit a POM for every named disease, most frequent first
+pom_diseases <- dis_freq$Disease_Name[dis_freq$n >= MIN_N_POM]
+pom_list <- Filter(Negate(is.null), lapply(pom_diseases, run_pom))
 
-pom_list <- Filter(Negate(is.null), list(pom_pvy, pom_eb, pom_vw, pom_plrv))
-pom_all  <- if (length(pom_list) > 0)
+pom_all <- if (length(pom_list) > 0)
   do.call(rbind, lapply(pom_list, function(x) x$results)) else data.frame()
+pom_fit <- if (length(pom_list) > 0)
+  do.call(rbind, lapply(pom_list, function(x) x$fit)) else data.frame()
 
+pom_sig <- if (nrow(pom_all) > 0) dplyr::filter(pom_all, Sig == "Yes") else pom_all
 cat("\n  POM significant results:\n")
-print(dplyr::filter(pom_all, Sig == "Yes")[, c("Disease", "Predictor", "OR", "CI_L", "CI_H", "p_value")],
-      row.names = FALSE)
+if (nrow(pom_sig) > 0)
+  print(pom_sig[, c("Disease", "Predictor", "OR", "CI_L", "CI_H", "p_value")], row.names = FALSE)
 
-# Values transcribed from the manuscript (not computed here)
-pom_fit_ms <- data.frame(
-  Disease         = c("PVY", "Early Blight", "Verticillium Wilt", "PLRV"),
-  n               = c(99L, 147L, 66L, 105L),
-  AIC             = c(310.19, 364.52, 87.59, 330.47),
-  McFadden_R2     = c(0.11, 0.09, 0.07, 0.02),
-  Brant_p_omnibus = c(0.312, 0.284, 0.401, 0.342),
-  MS_significant  = c("Temp OR=0.262 p=0.042; PlantAge OR=0.961 p=0.035",
-                      "Temp OR=0.360 p=0.013; PlantAge OR=1.033 p=0.020",
-                      "PlantAge OR=1.106 p=0.015",
-                      "none (all p>0.05)"),
-  stringsAsFactors = FALSE)
-
-save_tab(pom_all,                              "T07_POM_Results_Full.csv")
-save_tab(dplyr::filter(pom_all, Sig == "Yes"), "T08_POM_Results_Significant.csv")
-save_tab(pom_fit_ms,                           "T08b_POM_Fit_Manuscript.csv")
+save_tab(pom_all, "T07_POM_Results_Full.csv")
+save_tab(pom_sig, "T08_POM_Results_Significant.csv")
+save_tab(pom_fit, "T08b_POM_Model_Fit.csv")
 
 
 # ==============================================================================
 # SECTION 5: BINOMIAL LOGISTIC REGRESSION — DISEASE INCIDENCE
 # ==============================================================================
-cat("\n=== SECTION 5: Logistic regression (n=79 farms) ===\n")
+cat(sprintf("\n=== SECTION 5: Logistic regression (n=%d farms) ===\n", N_FARMS))
 
 run_logit <- function(outcome, label) {
-  fml <- as.formula(paste(outcome,
-    "~ Temperature_C + RH_pct + Soil_pH + Altitude + PlantAge + Density_Numeric"))
+  y <- df_farm[[outcome]]
+  if (length(unique(stats::na.omit(y))) < 2) {
+    cat("  SKIP:", label, "- outcome has no variation\n"); return(NULL)
+  }
+  fml <- as.formula(paste(outcome, "~", paste(PREDICTORS, collapse = " + ")))
   mod <- tryCatch(
     glm(fml, data = df_farm, family = binomial(link = "logit")),
     error = function(e) { cat("  ERROR:", label, "-", e$message, "\n"); NULL })
@@ -409,9 +456,10 @@ run_logit <- function(outcome, label) {
                   error = function(e) NA)
   cat(sprintf("  %s: AIC=%.2f | Nagelkerke R2=%.3f\n", label, AIC(mod), nag))
 
-  list(model = mod,
+  list(model   = mod,
+       disease = label,
        results = data.frame(
-         Disease       = label, n_farms = 79L,
+         Disease       = label, n_farms = N_FARMS,
          Predictor     = rownames(cf),
          OR            = round(exp(cf[, "Estimate"]), 3),
          CI_L          = round(exp(cis[, 1]), 3),
@@ -419,37 +467,30 @@ run_logit <- function(outcome, label) {
          p_value       = round(cf[, "Pr(>|z|)"], 4),
          Sig           = ifelse(cf[, "Pr(>|z|)"] < 0.05, "Yes", "No"),
          Nagelkerke_R2 = nag,
-         stringsAsFactors = FALSE))
+         stringsAsFactors = FALSE),
+       fit = data.frame(Disease = label, n_farms = N_FARMS,
+                        AIC = round(AIC(mod), 2), Nagelkerke_R2 = nag,
+                        stringsAsFactors = FALSE))
 }
 
-log_eb   <- run_logit("Inc_EarlyBlight",  "Early Blight")
-log_pvy  <- run_logit("Inc_PVY",          "PVY")
-log_vw   <- run_logit("Inc_Verticillium", "Verticillium Wilt")
-log_plrv <- run_logit("Inc_PLRV",         "PLRV")
-log_vmi  <- run_logit("Inc_VMI",          "Viral Mixed Infection")
+# One model per farm-level incidence column (Inc_<Disease>)
+inc_cols   <- grep("^Inc_", names(df_farm), value = TRUE)
+logit_list <- Filter(Negate(is.null),
+                     lapply(inc_cols, function(v) run_logit(v, sub("^Inc_", "", v))))
 
-logit_all <- do.call(rbind, lapply(
-  Filter(Negate(is.null), list(log_eb, log_pvy, log_vw, log_plrv, log_vmi)),
-  function(x) x$results))
+logit_all <- if (length(logit_list) > 0)
+  do.call(rbind, lapply(logit_list, function(x) x$results)) else data.frame()
+logit_fit <- if (length(logit_list) > 0)
+  do.call(rbind, lapply(logit_list, function(x) x$fit)) else data.frame()
 
+logit_sig <- if (nrow(logit_all) > 0) dplyr::filter(logit_all, Sig == "Yes") else logit_all
 cat("\n  Logistic significant results:\n")
-print(dplyr::filter(logit_all, Sig == "Yes")[, c("Disease", "Predictor", "OR", "CI_L", "CI_H", "p_value")],
-      row.names = FALSE)
+if (nrow(logit_sig) > 0)
+  print(logit_sig[, c("Disease", "Predictor", "OR", "CI_L", "CI_H", "p_value")], row.names = FALSE)
 
-# Values transcribed from the manuscript (not computed here)
-log_fit_ms <- data.frame(
-  Disease        = c("Early Blight", "PVY", "Verticillium Wilt", "Viral Mixed Infection"),
-  Nagelkerke_R2  = c(0.18, 0.29, 0.41, 0.12),
-  MS_significant = c(
-    "RH OR=0.91 p=0.008",
-    "RH OR=1.11 p=0.048; PlantAge OR=0.977 p=0.009; Density(High) OR=0.259 p<0.001",
-    "Temp OR=16.73 p=0.002; RH OR=0.820 p=0.013; PlantAge OR=0.956 p<0.001",
-    "Altitude OR=0.997 p=0.025"),
-  stringsAsFactors = FALSE)
-
-save_tab(logit_all,                              "T09_Logistic_Results_Full.csv")
-save_tab(dplyr::filter(logit_all, Sig == "Yes"), "T10_Logistic_Results_Significant.csv")
-save_tab(log_fit_ms,                             "T10b_Logistic_Fit_Manuscript.csv")
+save_tab(logit_all, "T09_Logistic_Results_Full.csv")
+save_tab(logit_sig, "T10_Logistic_Results_Significant.csv")
+save_tab(logit_fit, "T10b_Logistic_Model_Fit.csv")
 
 
 # ==============================================================================
@@ -481,25 +522,13 @@ run_mi <- function(model, label, lon_vec, lat_vec) {
              stringsAsFactors = FALSE)
 }
 
-pvy_dat <- dplyr::filter(named, Disease_Name == "PVY")
-eb_dat  <- dplyr::filter(named, Disease_Name == "Early Blight")
-vw_dat  <- dplyr::filter(named, Disease_Name == "Verticillium Wilt")
-
-mi_rows <- list(
-  if (!is.null(pom_pvy)) run_mi(pom_pvy$model, "POM PVY",
-                                pvy_dat$Longitude, pvy_dat$Latitude),
-  if (!is.null(pom_eb))  run_mi(pom_eb$model,  "POM Early Blight",
-                                eb_dat$Longitude,  eb_dat$Latitude),
-  if (!is.null(pom_vw))  run_mi(pom_vw$model,  "POM Verticillium Wilt",
-                                vw_dat$Longitude,  vw_dat$Latitude),
-  if (!is.null(log_eb))  run_mi(log_eb$model,  "Logistic Early Blight",
-                                df_farm$Longitude, df_farm$Latitude),
-  if (!is.null(log_pvy)) run_mi(log_pvy$model, "Logistic PVY",
-                                df_farm$Longitude, df_farm$Latitude),
-  if (!is.null(log_vw))  run_mi(log_vw$model,  "Logistic Verticillium Wilt",
-                                df_farm$Longitude, df_farm$Latitude),
-  if (!is.null(log_vmi)) run_mi(log_vmi$model, "Logistic VMI",
-                                df_farm$Longitude, df_farm$Latitude)
+mi_rows <- c(
+  lapply(pom_list, function(x) {
+    d <- dplyr::filter(named, Disease_Name == x$disease)
+    run_mi(x$model, paste("POM", x$disease), d$Longitude, d$Latitude)
+  }),
+  lapply(logit_list, function(x)
+    run_mi(x$model, paste("Logistic", x$disease), df_farm$Longitude, df_farm$Latitude))
 )
 morans_all <- do.call(rbind, Filter(Negate(is.null), mi_rows))
 if (!is.null(morans_all) && nrow(morans_all) > 0)
@@ -511,8 +540,14 @@ if (!is.null(morans_all) && nrow(morans_all) > 0)
 # ==============================================================================
 cat("\n=== SECTION 7: Figures ===\n")
 
-TOP10 <- c("Early Blight", "PLRV", "PVY", "Verticillium Wilt", "Late Blight",
-           "Rhizoctonia Canker", "Black Leg", "Grey Mold", "Brown Spot", "White Mold")
+freq_rank <- dis_freq %>%
+  dplyr::group_by(Disease_Name) %>%
+  dplyr::summarise(n = sum(n), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(n)) %>%
+  dplyr::pull(Disease_Name)
+TOP10 <- head(freq_rank, N_TOP)
+TOP8  <- head(freq_rank, 8)
+TOP6  <- head(freq_rank, 6)
 
 # ─── FIGURE 2 — Disease frequency ────────────────────────────────────────────
 f2_dat <- named %>%
@@ -520,7 +555,7 @@ f2_dat <- named %>%
   dplyr::count(Disease_Name, Disease_Type) %>%
   dplyr::mutate(
     Disease_Name = factor(Disease_Name, levels = rev(TOP10)),
-    pct   = round(n / 703 * 100, 1),
+    pct   = round(n / N_NAMED * 100, 1),
     label = paste0(n, " (", pct, "%)"))
 
 p2 <- ggplot(f2_dat, aes(x = n, y = Disease_Name, fill = Disease_Type)) +
@@ -528,10 +563,10 @@ p2 <- ggplot(f2_dat, aes(x = n, y = Disease_Name, fill = Disease_Type)) +
   geom_text(aes(label = label), hjust = -0.05, size = 3.8,
             fontface = "bold", colour = "grey20") +
   scale_fill_manual(values = DCOL, name = "Category") +
-  scale_x_continuous(expand = expansion(mult = c(0, 0.33)), breaks = seq(0, 150, 25)) +
-  labs(title = "Frequency of the Top 10 Potato Diseases by Plant-Level Observation Count",
+  scale_x_continuous(expand = expansion(mult = c(0, 0.33))) +
+  labs(title = sprintf("Frequency of the Top %d Diseases by Plant-Level Observation Count", length(TOP10)),
        x = "Number of Plant Observations", y = NULL,
-       caption = "★ Brown Spot = first confirmed record of Alternaria alternata on potato in Eritrea | n = 703 named records") +
+       caption = sprintf("n = %d named records", N_NAMED)) +
   PUB +
   theme(axis.text.y = element_text(size = 11.5), axis.line.y = element_blank(),
         axis.ticks.y = element_blank(), panel.grid.major.y = element_blank())
@@ -545,8 +580,12 @@ sub_f3 <- raw %>%
                    DSI   = dplyr::first(Subzone_Mean_DSI), .groups = "drop") %>%
   dplyr::arrange(dplyr::desc(W_Inc)) %>%
   dplyr::mutate(
-    Subzone_Display = factor(Subzone_Display, levels = Subzone_Display),
+    Subzone_Display = factor(Subzone_Display, levels = unique(Subzone_Display)),
     dsi_offset      = ifelse(dplyr::row_number() %% 2 == 0, 1.5, -1.5))
+
+regions <- sort(unique(as.character(sub_f3$Region)))
+RCOL    <- setNames(rep(PAL, length.out = length(regions)), regions)
+y3_max  <- max(c(sub_f3$W_Inc + 2, sub_f3$DSI * 10 + 3), na.rm = TRUE)
 
 p3 <- ggplot(sub_f3, aes(x = Subzone_Display)) +
   geom_col(aes(y = W_Inc, fill = Region), width = 0.65,
@@ -561,7 +600,7 @@ p3 <- ggplot(sub_f3, aes(x = Subzone_Display)) +
             colour = CA, size = 2.9, fontface = "bold") +
   scale_fill_manual(values = RCOL, name = "Region") +
   scale_y_continuous(
-    name = "Weighted Disease Incidence (%)", limits = c(0, 38),
+    name = "Weighted Disease Incidence (%)", limits = c(0, y3_max),
     sec.axis = sec_axis(~ . / 10, name = "Mean DSI (0–5 raw ordinal score)")) +
   labs(title = "Area-Weighted Disease Incidence (%) and Mean Disease Severity Index (0–5) by Sub-region",
        x = NULL) +
@@ -573,7 +612,7 @@ save_fig(p3, "Figure_3_Incidence_DSI_Subregion.png", 18, 8)
 # ─── FIGURE 4 — Disease proportion heatmap ───────────────────────────────────
 row_ord <- sub_f3 %>%
   dplyr::arrange(dplyr::desc(W_Inc)) %>%
-  dplyr::pull(Subzone_Display) %>% as.character()
+  dplyr::pull(Subzone_Display) %>% as.character() %>% unique()
 
 hm4 <- df_vis %>%
   dplyr::filter(Disease_Name %in% TOP10) %>%
@@ -591,11 +630,12 @@ p4 <- ggplot(hm4, aes(x = Disease_Name, y = Subzone_Display, fill = pct)) +
             size = 3.6, colour = "grey10", na.rm = TRUE) +
   scale_fill_gradientn(
     colours = c("#FFFDE7", "#FFF176", "#FFCA28", "#FB8C00", "#E64A19", "#BF360C"),
-    na.value = "#EFEFEF", name = "Proportion (%)", limits = c(0, 42),
+    na.value = "#EFEFEF", name = "Proportion (%)",
+    limits = c(0, max(hm4$pct, na.rm = TRUE)),
     guide = guide_colorbar(barwidth = 18, barheight = 0.8, title.position = "top")) +
-  labs(title = "Proportion (%) of Top 10 Disease Observations per Sub-region",
+  labs(title = sprintf("Proportion (%%) of Top %d Disease Observations per Sub-region", length(TOP10)),
        x = "Disease", y = NULL,
-       caption = "Grey = not recorded | VMI & AMV excluded | n = 631 specific named records") +
+       caption = sprintf("Grey = not recorded | n = %d specific named records", nrow(df_vis))) +
   theme_minimal(base_size = 12) +
   theme(plot.title   = element_text(face = "bold", size = 13, margin = margin(b = 10)),
         plot.caption = element_text(size = 9, colour = "grey45", hjust = 0),
@@ -605,159 +645,141 @@ p4 <- ggplot(hm4, aes(x = Disease_Name, y = Subzone_Display, fill = pct)) +
         legend.position = "bottom", plot.margin = margin(10, 12, 10, 10))
 save_fig(p4, "Figure_4_Disease_Heatmap.png", 18, 8.5)
 
-# ─── FIGURE 5 — Forest plot ──────────────────────────────────────────────────
-# NOTE: POM_MS and LOG_MS are transcribed from the manuscript; they are not
-# taken from pom_all / logit_all computed above. See transparency note in header.
-POM_MS <- data.frame(
-  Disease   = c("PVY", "PVY", "Early Blight", "Early Blight", "Verticillium Wilt"),
-  Predictor = c("Temperature (per 1°C)", "Plant Age (per day)",
-                "Temperature (per 1°C)", "Plant Age (per day)",
-                "Plant Age (per day)"),
-  OR      = c(0.262, 0.961, 0.360, 1.033, 1.106),
-  CI_L    = c(0.072, 0.927, 0.160, 1.005, 1.019),
-  CI_H    = c(0.950, 0.997, 0.807, 1.061, 1.199),
-  p_value = c(0.042, 0.035, 0.013, 0.020, 0.015),
-  stringsAsFactors = FALSE)
-POM_MS$Disease <- factor(POM_MS$Disease,
-                         levels = c("PVY", "Early Blight", "Verticillium Wilt"))
-POM_MS$pcol <- ifelse(POM_MS$OR < 1, "#2166AC", "#B5342A")
-POM_MS$plab <- sprintf("p=%.3f *", POM_MS$p_value)
+# ─── FIGURE 5 — Forest plot of significant predictors (computed above) ───────
+forest_dat <- function(sig_tab) {
+  if (nrow(sig_tab) == 0) return(sig_tab)
+  d <- dplyr::filter(sig_tab, is.finite(CI_L), is.finite(CI_H), CI_L > 0, OR > 0)
+  d$Predictor <- lab_pred(d$Predictor)
+  d$pcol <- ifelse(d$OR < 1, "#2166AC", "#B5342A")
+  d$plab <- paste0(fmt_p(d$p_value), stars(d$p_value))
+  d
+}
+no_sig <- function(all_tab, sig_tab)
+  setdiff(unique(all_tab$Disease), unique(sig_tab$Disease))
 
-pA <- ggplot(POM_MS, aes(x = OR, y = reorder(Predictor, -OR), xmin = CI_L, xmax = CI_H)) +
-  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.8) +
-  geom_errorbarh(aes(colour = pcol), height = 0.22, linewidth = 1.8, alpha = 0.9) +
-  geom_point(aes(colour = pcol), size = 5, shape = 23, fill = "white", stroke = 2) +
-  geom_text(aes(x = CI_H, label = paste0(" ", plab)), hjust = 0, size = 3.5, colour = "grey25") +
-  scale_colour_identity() +
-  scale_x_log10(breaks = c(0.1, 0.25, 0.5, 1, 1.1, 1.5),
-                labels = c("0.10", "0.25", "0.50", "1", "1.10", "1.50"),
-                expand = expansion(mult = c(0.05, 0.55))) +
-  facet_wrap(~Disease, scales = "free_y", ncol = 3,
-             labeller = labeller(Disease = c(
-               "PVY"               = "PVY (n=99; AIC=310.19; McFadden R²=0.11)",
-               "Early Blight"      = "Early Blight (n=147; AIC=364.52; McFadden R²=0.09)",
-               "Verticillium Wilt" = "Verticillium Wilt (n=66; AIC=87.59; McFadden R²=0.07)"))) +
-  labs(title = "(A) Disease Severity — Proportional Odds Model | Plant-level observations",
-       x = "Odds Ratio (log scale) with 95% profile-likelihood CI", y = NULL,
-       caption = "Blue = OR<1 p<0.05 (protective) | Red = OR>1 p<0.05 (positive) | PLRV: all p>0.05") +
-  PUB + theme(panel.grid.major.y = element_blank(), strip.text = element_text(size = 9.5))
+POM_F <- forest_dat(pom_sig)
+LOG_F <- forest_dat(logit_sig)
+panels <- list()
 
-LOG_MS <- data.frame(
-  Disease   = c("Early Blight", "PVY", "PVY", "PVY",
-                "Verticillium Wilt", "Verticillium Wilt", "Verticillium Wilt",
-                "Viral Mixed Infection"),
-  Predictor = c("Relative Humidity\n(per 1%)", "Relative Humidity\n(per 1%)",
-                "Plant Age\n(per day)", "Density High\n(vs Low)",
-                "Temperature\n(per 1°C)", "Relative Humidity\n(per 1%)",
-                "Plant Age\n(per day)", "Altitude\n(per 1 m)"),
-  OR      = c(0.91, 1.11, 0.977, 0.259, 16.73, 0.820, 0.956, 0.997),
-  CI_L    = c(0.85, 1.00, 0.962, 0.117, 2.930, 0.700, 0.926, 0.994),
-  CI_H    = c(0.97, 1.22, 0.993, 0.574, 95.40, 0.961, 0.987, 0.999),
-  p_value = c(0.008, 0.048, 0.009, 0.001, 0.002, 0.013, 0.001, 0.025),
-  stringsAsFactors = FALSE)
-LOG_MS$Disease <- factor(LOG_MS$Disease,
-                         levels = c("Early Blight", "PVY", "Verticillium Wilt", "Viral Mixed Infection"))
-LOG_MS$pcol  <- ifelse(LOG_MS$OR < 1, "#2166AC", "#B5342A")
-LOG_MS$stars <- ifelse(LOG_MS$p_value < 0.001, "***", ifelse(LOG_MS$p_value < 0.01, "**", "*"))
-LOG_MS$plab  <- ifelse(LOG_MS$p_value < 0.001, "p<0.001", sprintf("p=%.3f", LOG_MS$p_value))
+if (nrow(POM_F) > 0) {
+  POM_F$Disease <- factor(POM_F$Disease, levels = unique(POM_F$Disease))
+  pom_lab <- with(pom_fit, setNames(
+    sprintf("%s (n=%d; AIC=%.2f; McFadden R²=%.2f)", Disease, n, AIC, McFadden_R2), Disease))
+  ns_pom  <- no_sig(pom_all, pom_sig)
 
-pB <- ggplot(LOG_MS, aes(x = OR, y = reorder(Predictor, -OR), xmin = CI_L, xmax = CI_H)) +
-  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.8) +
-  geom_errorbarh(aes(colour = pcol), height = 0.22, linewidth = 1.8, alpha = 0.9) +
-  geom_point(aes(colour = pcol), size = 5, shape = 23, fill = "white", stroke = 2) +
-  geom_text(aes(x = pmax(CI_H, OR * 1.05), label = paste0(" ", plab, stars)),
-            hjust = 0, size = 3.4, colour = "grey25") +
-  scale_colour_identity() +
-  scale_x_log10(expand = expansion(mult = c(0.05, 0.60))) +
-  facet_wrap(~Disease, scales = "free_y", ncol = 4,
-             labeller = labeller(Disease = c(
-               "Early Blight"          = "Early Blight\n(Nag.R²=0.18)",
-               "PVY"                   = "PVY\n(Nag.R²=0.29)",
-               "Verticillium Wilt"     = "Verticillium Wilt\n(Nag.R²=0.41)",
-               "Viral Mixed Infection" = "Viral Mixed Infection\n(Nag.R²=0.12)"))) +
-  labs(title = "(B) Disease Incidence — Binomial Logistic Regression | Farm-level binary (n=79 farms)",
-       x = "Odds Ratio (log scale) with 95% Wald CI", y = NULL,
-       caption = "OR = exp(β); β = log-odds change per unit — NOT a probability change (Hosmer et al., 2013)") +
-  PUB + theme(panel.grid.major.y = element_blank(), strip.text = element_text(size = 9.5))
+  panels$A <- ggplot(POM_F, aes(x = OR, y = reorder(Predictor, -OR), xmin = CI_L, xmax = CI_H)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.8) +
+    geom_errorbarh(aes(colour = pcol), height = 0.22, linewidth = 1.8, alpha = 0.9) +
+    geom_point(aes(colour = pcol), size = 5, shape = 23, fill = "white", stroke = 2) +
+    geom_text(aes(x = CI_H, label = paste0(" ", plab)), hjust = 0, size = 3.5, colour = "grey25") +
+    scale_colour_identity() +
+    scale_x_log10(expand = expansion(mult = c(0.05, 0.55))) +
+    facet_wrap(~Disease, scales = "free_y", ncol = min(3, nlevels(POM_F$Disease)),
+               labeller = labeller(Disease = pom_lab)) +
+    labs(title = "(A) Disease Severity — Proportional Odds Model | Plant-level observations",
+         x = "Odds Ratio (log scale) with 95% profile-likelihood CI", y = NULL,
+         caption = paste0("Blue = OR<1 p<0.05 (protective) | Red = OR>1 p<0.05 (positive)",
+                          if (length(ns_pom) > 0)
+                            paste0(" | No significant predictors: ", paste(ns_pom, collapse = ", ")))) +
+    PUB + theme(panel.grid.major.y = element_blank(), strip.text = element_text(size = 9.5))
+}
 
-p5 <- pA / pB + plot_layout(heights = c(1, 0.9))
-save_fig(p5, "Figure_5_ForestPlot_POM_Logistic.png", 19, 14)
+if (nrow(LOG_F) > 0) {
+  LOG_F$Predictor <- sub(" \\(", "\n(", LOG_F$Predictor)
+  LOG_F$Disease   <- factor(LOG_F$Disease, levels = unique(LOG_F$Disease))
+  log_lab <- with(logit_fit, setNames(
+    sprintf("%s\n(Nag.R²=%.2f)", Disease, Nagelkerke_R2), Disease))
 
-# ─── FIGURE 6 — Historical trends (values compiled from literature) ──────────
-# Source(s): <REFERENCES FOR HISTORICAL DATA>
-hist_v <- data.frame(
-  Year = c(2003, 2005, 2007, 2008, 2010, 2012, 2015, 2018, 2019, 2020, 2021, 2022),
-  PLRV = c(21.4, 35, 42, 50, 60, 68, 78, 88, 92, 96, 100, 100),
-  PVY  = c(7.5, 15, 20, 28, 40, 55, 60, 65, 70, 75, 80, 82.3))
-pvx_d <- data.frame(Year = c(2007, 2010, 2012, 2015, 2016, 2018),
-                    PVX  = c(12.5, 25, 40, 55, 66.7, 45))
+  panels$B <- ggplot(LOG_F, aes(x = OR, y = reorder(Predictor, -OR), xmin = CI_L, xmax = CI_H)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey55", linewidth = 0.8) +
+    geom_errorbarh(aes(colour = pcol), height = 0.22, linewidth = 1.8, alpha = 0.9) +
+    geom_point(aes(colour = pcol), size = 5, shape = 23, fill = "white", stroke = 2) +
+    geom_text(aes(x = pmax(CI_H, OR * 1.05), label = paste0(" ", plab)),
+              hjust = 0, size = 3.4, colour = "grey25") +
+    scale_colour_identity() +
+    scale_x_log10(expand = expansion(mult = c(0.05, 0.60))) +
+    facet_wrap(~Disease, scales = "free_y", ncol = min(4, nlevels(LOG_F$Disease)),
+               labeller = labeller(Disease = log_lab)) +
+    labs(title = sprintf("(B) Disease Incidence — Binomial Logistic Regression | Farm-level binary (n=%d farms)", N_FARMS),
+         x = "Odds Ratio (log scale) with 95% Wald CI", y = NULL,
+         caption = "OR = exp(β); β = log-odds change per unit — NOT a probability change (Hosmer et al., 2013)") +
+    PUB + theme(panel.grid.major.y = element_blank(), strip.text = element_text(size = 9.5))
+}
 
-hv <- tidyr::pivot_longer(hist_v, -Year, names_to = "Virus", values_to = "Inc")
-pv <- tidyr::pivot_longer(pvx_d,  -Year, names_to = "Virus", values_to = "Inc")
-av <- rbind(hv, pv); av$Virus <- factor(av$Virus, levels = c("PLRV", "PVY", "PVX"))
-VCOL <- c(PLRV = CV, PVY = CG, PVX = CB)
+if (length(panels) > 0) {
+  p5 <- patchwork::wrap_plots(panels, ncol = 1)
+  save_fig(p5, "Figure_5_ForestPlot_POM_Logistic.png", 19, 7 * length(panels))
+} else {
+  cat("  Figure 5 skipped: no significant predictors in either model\n")
+}
 
-p6a <- ggplot(av, aes(Year, Inc, colour = Virus, shape = Virus)) +
-  geom_line(linewidth = 2.0) + geom_point(size = 3.5, stroke = 1.5, fill = "white") +
-  annotate("text", x = 2020.5, y = 103, label = "100%", colour = CV, fontface = "bold", size = 4.2) +
-  scale_colour_manual(values = VCOL) +
-  scale_shape_manual(values = c(PLRV = 21, PVY = 22, PVX = 24)) +
-  scale_x_continuous(breaks = seq(2003, 2022, 3)) +
-  coord_cartesian(ylim = c(0, 115)) +
-  labs(title = "(A) Historical Viral Disease Incidence (1995–2022)", x = "Year", y = "Incidence (%)") + PUB
+# ─── FIGURE 6 — Historical trends (optional external data) ───────────────────
+p6_parts <- list()
 
-cum <- data.frame(Year      = c(1995, 2000, 2003, 2007, 2010, 2015, 2018, 2020, 2022),
-                  Fungal    = c(2, 3, 3, 4, 5, 6, 7, 9, 10),
-                  Viral     = c(0, 0, 2, 4, 5, 5, 7, 10, 13),
-                  Bacterial = c(0, 0, 0, 0, 0, 0, 1, 2, 3))
-cl <- tidyr::pivot_longer(cum, -Year, names_to = "Type", values_to = "n")
-cl$Type <- factor(cl$Type, levels = c("Fungal", "Viral", "Bacterial"))
+if (file.exists(HIST_INCIDENCE_FILE)) {
+  av <- read.csv(HIST_INCIDENCE_FILE, stringsAsFactors = FALSE)
+  av$Group <- factor(av$Group, levels = unique(av$Group))
+  grp  <- levels(av$Group)
+  p6_parts$a <- ggplot(av, aes(Year, Incidence_pct, colour = Group, shape = Group)) +
+    geom_line(linewidth = 2.0) + geom_point(size = 3.5, stroke = 1.5, fill = "white") +
+    scale_colour_manual(values = setNames(rep(PAL, length.out = length(grp)), grp)) +
+    scale_shape_manual(values = setNames(rep(c(21, 22, 24, 23, 25), length.out = length(grp)), grp)) +
+    labs(title = "(A) Historical Disease Incidence", x = "Year", y = "Incidence (%)", colour = NULL, shape = NULL) + PUB
+}
 
-p6b <- ggplot(cl, aes(Year, n, colour = Type, shape = Type)) +
-  geom_line(linewidth = 2.0) + geom_point(size = 3.5, stroke = 1.5, fill = "white") +
-  scale_colour_manual(values = DCOL) + scale_shape_manual(values = c(Fungal = 21, Viral = 22, Bacterial = 24)) +
-  scale_x_continuous(breaks = seq(1995, 2022, 5)) +
-  labs(title = "(B) Cumulative Disease Taxa Documented", x = "Year", y = "Cumulative taxa (n)") + PUB
+if (file.exists(HIST_TAXA_FILE)) {
+  cl <- read.csv(HIST_TAXA_FILE, stringsAsFactors = FALSE)
+  cl$Disease_Type <- factor(cl$Disease_Type, levels = intersect(names(DCOL), unique(cl$Disease_Type)))
+  p6_parts$b <- ggplot(cl, aes(Year, Cumulative_n, colour = Disease_Type, shape = Disease_Type)) +
+    geom_line(linewidth = 2.0) + geom_point(size = 3.5, stroke = 1.5, fill = "white") +
+    scale_colour_manual(values = DCOL) + scale_shape_manual(values = c(Fungal = 21, Viral = 22, Bacterial = 24)) +
+    labs(title = "(B) Cumulative Disease Taxa Documented", x = "Year", y = "Cumulative taxa (n)",
+         colour = "Type", shape = "Type") + PUB
+}
 
-p6 <- p6a + p6b + plot_layout(ncol = 2) +
-  plot_annotation(title = "Historical Trends in Potato Disease Documentation in Eritrea (1995–2022)",
-                  theme = theme(plot.title = element_text(face = "bold", size = 13, margin = margin(b = 6))))
-save_fig(p6, "Figure_6_Historical_Trends.png", 17, 7)
+if (length(p6_parts) > 0) {
+  p6 <- patchwork::wrap_plots(p6_parts, nrow = 1) +
+    plot_annotation(title = "Historical Trends in Disease Documentation",
+                    theme = theme(plot.title = element_text(face = "bold", size = 13, margin = margin(b = 6))))
+  save_fig(p6, "Figure_6_Historical_Trends.png", 8.5 * length(p6_parts), 7)
+} else {
+  cat("  Figure 6 skipped: historical data files not provided\n")
+}
 
 # ─── FIGURE 7 — Altitude distribution ────────────────────────────────────────
-TOP8 <- c("Early Blight", "PVY", "PLRV", "Verticillium Wilt",
-          "Late Blight", "Rhizoctonia Canker", "Black Leg", "Grey Mold")
-
 alt8 <- named %>%
   dplyr::filter(Disease_Name %in% TOP8) %>%
   dplyr::mutate(Disease_Name = factor(Disease_Name,
     levels = names(sort(tapply(Altitude, Disease_Name, median, na.rm = TRUE), decreasing = TRUE))))
-vw_mean <- mean(named$Altitude[named$Disease_Name == "Verticillium Wilt"], na.rm = TRUE)
 
 set.seed(42)
 p7 <- ggplot(alt8, aes(x = Disease_Name, y = Altitude, fill = Disease_Type)) +
   geom_boxplot(alpha = 0.60, width = 0.55, outlier.shape = NA, linewidth = 0.6) +
   geom_jitter(aes(colour = Disease_Type), width = 0.14, alpha = 0.20, size = 1.6, shape = 16) +
-  geom_hline(yintercept = vw_mean, colour = "#B5342A", linetype = "dashed", linewidth = 1.5, alpha = 0.85) +
   scale_fill_manual(values = DCOL, name = "Category") +
   scale_colour_manual(values = DCOL, guide = "none") +
   scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0.02, 0.06))) +
-  labs(title = "Altitudinal Distribution of Disease Occurrences Across the Top Eight Most Prevalent Diseases",
-       x = NULL, y = "Altitude (m a.s.l.)",
-       caption = sprintf("Dashed red line = mean altitude of Verticillium Wilt observations (%.0f m a.s.l.)", vw_mean)) +
+  labs(title = sprintf("Altitudinal Distribution of Disease Occurrences Across the Top %d Most Prevalent Diseases",
+                       length(TOP8)),
+       x = NULL, y = "Altitude (m a.s.l.)") +
   PUB + theme(axis.text.x = element_text(angle = 20, hjust = 1, size = 11.5))
+
+if (has_focal) {
+  foc_mean <- mean(named$Altitude[named$Disease_Name == FOCAL_DISEASE], na.rm = TRUE)
+  p7 <- p7 +
+    geom_hline(yintercept = foc_mean, colour = "#B5342A", linetype = "dashed", linewidth = 1.5, alpha = 0.85) +
+    labs(caption = sprintf("Dashed red line = mean altitude of %s observations (%.0f m a.s.l.)",
+                           FOCAL_DISEASE, foc_mean))
+}
 save_fig(p7, "Figure_7_Altitude_Distribution.png", 15, 7.5)
 
 # ─── FIGURE 8 — DSI heatmap ──────────────────────────────────────────────────
-DIS8 <- c("PLRV", "PVY", "Early Blight", "Late Blight", "Verticillium Wilt",
-          "Rhizoctonia Canker", "Black Leg", "Brown Spot", "Grey Mold", "White Mold")
-
-dsi8 <- df_vis %>%
-  dplyr::filter(Disease_Name %in% DIS8) %>%
+dsi8_src <- dplyr::filter(df_vis, Disease_Name %in% TOP10, !is.na(Severity))
+dsi8 <- dsi8_src %>%
   dplyr::group_by(Subzone_Display, Disease_Name) %>%
   dplyr::summarise(Mean_DSI = round(mean(Severity, na.rm = TRUE), 2), .groups = "drop") %>%
-  tidyr::complete(Subzone_Display, Disease_Name = DIS8) %>%
-  dplyr::mutate(Disease_Name    = factor(Disease_Name, levels = DIS8),
+  tidyr::complete(Subzone_Display, Disease_Name = TOP10) %>%
+  dplyr::mutate(Disease_Name    = factor(Disease_Name, levels = TOP10),
                 Subzone_Display = factor(Subzone_Display, levels = rev(row_ord)))
 
 p8 <- ggplot(dsi8, aes(x = Disease_Name, y = Subzone_Display, fill = Mean_DSI)) +
@@ -769,7 +791,8 @@ p8 <- ggplot(dsi8, aes(x = Disease_Name, y = Subzone_Display, fill = Mean_DSI)) 
                        guide = guide_colorbar(barwidth = 20, barheight = 0.8, title.position = "top")) +
   labs(title = "Mean Disease Severity Index (0–5) by Disease and Sub-region",
        x = "Disease", y = NULL,
-       caption = "Grey = not recorded | DSI = mean raw ordinal score (0–5) | n=740 observations") +
+       caption = sprintf("Grey = not recorded | DSI = mean raw ordinal score (0–5) | n=%d observations",
+                         nrow(dsi8_src))) +
   theme_minimal(base_size = 12) +
   theme(plot.title   = element_text(face = "bold", size = 13, margin = margin(b = 10)),
         plot.caption = element_text(size = 9, colour = "grey45", hjust = 0),
@@ -780,8 +803,6 @@ p8 <- ggplot(dsi8, aes(x = Disease_Name, y = Subzone_Display, fill = Mean_DSI)) 
 save_fig(p8, "Figure_8_DSI_Heatmap.png", 18, 8.5)
 
 # ─── FIGURE 9 — Severity distribution ────────────────────────────────────────
-TOP6 <- c("PLRV", "PVY", "Early Blight", "Late Blight", "Verticillium Wilt", "Rhizoctonia Canker")
-
 sev6 <- named %>%
   dplyr::filter(Disease_Name %in% TOP6) %>%
   dplyr::mutate(Disease_Name = factor(Disease_Name, levels = TOP6))
@@ -805,9 +826,10 @@ p9 <- ggplot(sev6, aes(x = Disease_Name, y = Severity, fill = Disease_Type)) +
   scale_y_continuous(breaks = 1:5,
                      labels = c("1\n(very mild)", "2\n(mild)", "3\n(moderate)", "4\n(severe)", "5\n(very severe)"),
                      limits = c(0.5, 6.5), expand = expansion(mult = c(0, 0.02))) +
-  labs(title = "Severity Score Distribution for Six Major Potato Diseases", x = NULL,
-       y = "Severity Score (0–5 ordinal scale)",
-       caption = "Diamond = mean severity per disease | Kruskal-Wallis H=149.21, p<0.001") +
+  labs(title = sprintf("Severity Score Distribution for the %d Most Frequent Diseases", length(TOP6)),
+       x = NULL, y = "Severity Score (0–5 ordinal scale)",
+       caption = sprintf("Diamond = mean severity per disease | Kruskal-Wallis (severity by disease type) H=%.2f, %s",
+                         kw_sev$statistic, fmt_p(kw_sev$p.value))) +
   PUB + theme(axis.text.x = element_text(angle = 16, hjust = 1, size = 11.5))
 save_fig(p9, "Figure_9_Severity_Distribution.png", 14, 8)
 
@@ -822,16 +844,18 @@ consolidated <- rbind(
              Test = nonpar_tab$Test, Statistic = as.character(nonpar_tab$Statistic),
              p_value = nonpar_tab$p_value, Sig = nonpar_tab$Sig,
              stringsAsFactors = FALSE),
-  data.frame(Model = "POM",
-             Test = paste(pom_all$Disease, pom_all$Predictor, sep = " — "),
-             Statistic = paste0("OR=", pom_all$OR),
-             p_value = as.character(pom_all$p_value),
-             Sig = pom_all$Sig, stringsAsFactors = FALSE),
-  data.frame(Model = "Logistic",
-             Test = paste(logit_all$Disease, logit_all$Predictor, sep = " — "),
-             Statistic = paste0("OR=", logit_all$OR),
-             p_value = as.character(logit_all$p_value),
-             Sig = logit_all$Sig, stringsAsFactors = FALSE)
+  if (nrow(pom_all) > 0)
+    data.frame(Model = "POM",
+               Test = paste(pom_all$Disease, pom_all$Predictor, sep = " — "),
+               Statistic = paste0("OR=", pom_all$OR),
+               p_value = as.character(pom_all$p_value),
+               Sig = pom_all$Sig, stringsAsFactors = FALSE),
+  if (nrow(logit_all) > 0)
+    data.frame(Model = "Logistic",
+               Test = paste(logit_all$Disease, logit_all$Predictor, sep = " — "),
+               Statistic = paste0("OR=", logit_all$OR),
+               p_value = as.character(logit_all$p_value),
+               Sig = logit_all$Sig, stringsAsFactors = FALSE)
 )
 save_tab(consolidated, "T12_Consolidated_All_Results.csv")
 
@@ -839,8 +863,6 @@ save_tab(consolidated, "T12_Consolidated_All_Results.csv")
 # so that individual farms cannot be identified if outputs are shared.
 save_tab(as.data.frame(dplyr::select(df_farm, -Name, -Longitude, -Latitude)),
          "T13_Farm_Level_Data.csv")
-save_tab(POM_MS, "T14_POM_Manuscript_OR_Values.csv")
-save_tab(LOG_MS, "T15_Logistic_Manuscript_OR_Values.csv")
 
 # Excel workbook with all sheets
 wb <- createWorkbook()
@@ -852,15 +874,13 @@ tabs <- list(
   T05_Environment   = env_summary,
   T06_NonParametric = nonpar_tab,
   T07_POM_Full      = pom_all,
-  T08_POM_Sig       = dplyr::filter(pom_all, Sig == "Yes"),
-  T08b_POM_Fit_MS   = pom_fit_ms,
+  T08_POM_Sig       = pom_sig,
+  T08b_POM_Fit      = pom_fit,
   T09_Logistic_Full = logit_all,
-  T10_Logistic_Sig  = dplyr::filter(logit_all, Sig == "Yes"),
-  T10b_Logistic_MS  = log_fit_ms,
+  T10_Logistic_Sig  = logit_sig,
+  T10b_Logistic_Fit = logit_fit,
   T11_MoransI       = if (!is.null(morans_all)) morans_all else data.frame(),
-  T12_Consolidated  = consolidated,
-  T14_POM_MS_Values = POM_MS,
-  T15_Log_MS_Values = LOG_MS
+  T12_Consolidated  = consolidated
 )
 hs <- createStyle(textDecoration = "bold", fgFill = "#1A3A5C",
                   fontColour = "#FFFFFF", border = "Bottom")
